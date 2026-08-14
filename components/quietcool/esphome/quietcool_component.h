@@ -8,6 +8,7 @@
 #include "quietcool/radio/burst_transmitter.h"
 
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/event/event.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/text_sensor/text_sensor.h"
@@ -150,6 +151,17 @@ class QuietCoolComponent final : public Component {
     permission_switch_ = permission_switch;
     if (permission_switch_ != nullptr)
       permission_switch_->publish_state(permission_to_start_);
+  }
+  // Fires a discrete HA "event" entity every time request_state() refuses a
+  // start command for lack of permission (see request_state()'s definition).
+  // Deliberately NOT routed through the existing Command Confirmation Status
+  // text sensor: that sensor only republishes to Home Assistant on a VALUE
+  // CHANGE, so a second denial in a row (same "refused" text) would be
+  // invisible in the Logbook. event::Event::trigger() always publishes a
+  // fresh, timestamped state regardless of repetition, which is what makes a
+  // repeated "someone tried to start it without permission" visible.
+  void set_start_refused_event(event::Event* start_refused_event) {
+    start_refused_event_ = start_refused_event;
   }
   // True once it is safe to energize the fan: either Home Assistant has
   // explicitly granted permission (the switch's write_state path), or the
@@ -368,6 +380,7 @@ class QuietCoolComponent final : public Component {
   // default.
   bool permission_to_start_{false};
   switch_::Switch* permission_switch_{nullptr};
+  event::Event* start_refused_event_{nullptr};
 };
 
 }  // namespace esphome::quietcool

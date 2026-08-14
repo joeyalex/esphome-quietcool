@@ -219,6 +219,18 @@ switch:
     # the very first post-boot refresh finds the fan already running. See
     # the "Safety" section of README.md.
 
+event:
+  - platform: quietcool
+    id: fan_start_refused
+    controller_id: quietcool_controller
+    name: "Fan Start Refused"
+    # Fires every time the Permission To Start failsafe above blocks a start
+    # command — including a repeat attempt while it is still off. Unlike a
+    # text sensor, an event entity always logs a fresh, timestamped entry in
+    # Home Assistant's Logbook regardless of repetition, so this is what to
+    # automate on (e.g. a notification) if someone tries to start the fan
+    # before permission has been granted.
+
 binary_sensor:
   - platform: quietcool
     id: fan_state_known

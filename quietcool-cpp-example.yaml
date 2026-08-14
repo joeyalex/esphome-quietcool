@@ -111,6 +111,17 @@ switch:
     controller_id: quietcool_controller
     name: "Permission To Start"
 
+# HA-visible signal for a permission-to-start refusal (see
+# quietcool-cpp-lora32.yaml's matching block for why this is an `event`
+# entity, not a text sensor). Declared here for the same CI reason as switch
+# and select: this is one of the two examples CI actually compiles, so this
+# is what makes CI execute event.py's code generation at all.
+event:
+  - platform: quietcool
+    id: fan_start_refused
+    controller_id: quietcool_controller
+    name: "Fan Start Refused"
+
 # Every option transmits and every option RUNS the fan: a duration started on
 # a stopped fan starts it (at Low), and "None" means no timer — run until
 # stopped — which restarts a fan whose timer already expired. This block also

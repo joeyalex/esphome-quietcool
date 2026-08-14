@@ -16,6 +16,7 @@ from esphome.const import CONF_ID, CONF_TYPE
 AUTO_LOAD = [
     "binary_sensor",
     "button",
+    "event",
     "fan",
     "select",
     "sensor",

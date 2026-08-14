@@ -102,6 +102,15 @@ switch:
     controller_id: quietcool_controller
     name: "Permission To Start"
 
+# HA-visible signal for a permission-to-start refusal — see
+# quietcool-cpp-lora32.yaml's matching block for why this is an `event`
+# entity rather than a text sensor.
+event:
+  - platform: quietcool
+    id: fan_start_refused
+    controller_id: quietcool_controller
+    name: "Fan Start Refused"
+
 binary_sensor:
   - platform: quietcool
     controller_id: quietcool_controller

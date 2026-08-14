@@ -1,0 +1,332 @@
+diff -Nur diffbase/components/quietcool/__init__.py diffnew/components/quietcool/__init__.py
+--- diffbase/components/quietcool/__init__.py	2026-08-14 04:20:32.268772959 +0000
++++ diffnew/components/quietcool/__init__.py	2026-08-14 04:20:32.306189412 +0000
+@@ -16,6 +16,7 @@
+ AUTO_LOAD = [
+     "binary_sensor",
+     "button",
++    "event",
+     "fan",
+     "select",
+     "sensor",
+diff -Nur diffbase/components/quietcool/esphome/quietcool_component.cpp diffnew/components/quietcool/esphome/quietcool_component.cpp
+--- diffbase/components/quietcool/esphome/quietcool_component.cpp	2026-08-14 04:20:32.270873783 +0000
++++ diffnew/components/quietcool/esphome/quietcool_component.cpp	2026-08-14 04:20:32.309568020 +0000
+@@ -227,6 +227,13 @@
+              "Confirm enough windows are open for makeup air, then enable "
+              "the Permission To Start switch (Refresh and Off remain "
+              "available while it is off).");
++    // Home Assistant visibility for this specific refusal (see
++    // set_start_refused_event()'s declaration): the core is never told
++    // about a gate-level refusal, so nothing else publishes anything HA can
++    // see for it. trigger() fires every call, not just on change, so a
++    // second denial in a row still shows up in the Logbook.
++    if (start_refused_event_ != nullptr)
++      start_refused_event_->trigger("no_permission");
+     return;
+   }
+   const auto now_ms = clock_.now_ms();
+diff -Nur diffbase/components/quietcool/esphome/quietcool_component.h diffnew/components/quietcool/esphome/quietcool_component.h
+--- diffbase/components/quietcool/esphome/quietcool_component.h	2026-08-14 04:20:32.270914139 +0000
++++ diffnew/components/quietcool/esphome/quietcool_component.h	2026-08-14 04:20:32.309609517 +0000
+@@ -8,6 +8,7 @@
+ #include "quietcool/radio/burst_transmitter.h"
+ 
+ #include "esphome/components/binary_sensor/binary_sensor.h"
++#include "esphome/components/event/event.h"
+ #include "esphome/components/sensor/sensor.h"
+ #include "esphome/components/switch/switch.h"
+ #include "esphome/components/text_sensor/text_sensor.h"
+@@ -151,6 +152,17 @@
+     if (permission_switch_ != nullptr)
+       permission_switch_->publish_state(permission_to_start_);
+   }
++  // Fires a discrete HA "event" entity every time request_state() refuses a
++  // start command for lack of permission (see request_state()'s definition).
++  // Deliberately NOT routed through the existing Command Confirmation Status
++  // text sensor: that sensor only republishes to Home Assistant on a VALUE
++  // CHANGE, so a second denial in a row (same "refused" text) would be
++  // invisible in the Logbook. event::Event::trigger() always publishes a
++  // fresh, timestamped state regardless of repetition, which is what makes a
++  // repeated "someone tried to start it without permission" visible.
++  void set_start_refused_event(event::Event* start_refused_event) {
++    start_refused_event_ = start_refused_event;
++  }
+   // True once it is safe to energize the fan: either Home Assistant has
+   // explicitly granted permission (the switch's write_state path), or the
+   // mandatory on-boot refresh found the fan already confirmed running (see
+@@ -368,6 +380,7 @@
+   // default.
+   bool permission_to_start_{false};
+   switch_::Switch* permission_switch_{nullptr};
++  event::Event* start_refused_event_{nullptr};
+ };
+ 
+ }  // namespace esphome::quietcool
+diff -Nur diffbase/components/quietcool/esphome/quietcool_permission_event.cpp diffnew/components/quietcool/esphome/quietcool_permission_event.cpp
+--- diffbase/components/quietcool/esphome/quietcool_permission_event.cpp	1970-01-01 00:00:00.000000000 +0000
++++ diffnew/components/quietcool/esphome/quietcool_permission_event.cpp	2026-08-14 04:20:32.308951270 +0000
+@@ -0,0 +1,14 @@
++#include "quietcool_permission_event.h"
++
++namespace esphome::quietcool {
++namespace {
++
++constexpr char TAG[] = "quietcool.permission_event";
++
++}  // namespace
++
++void QuietCoolStartRefusedEvent::dump_config() {
++  LOG_EVENT("", "QuietCool Start Refused", this);
++}
++
++}  // namespace esphome::quietcool
+diff -Nur diffbase/components/quietcool/esphome/quietcool_permission_event.h diffnew/components/quietcool/esphome/quietcool_permission_event.h
+--- diffbase/components/quietcool/esphome/quietcool_permission_event.h	1970-01-01 00:00:00.000000000 +0000
++++ diffnew/components/quietcool/esphome/quietcool_permission_event.h	2026-08-14 04:20:32.308921885 +0000
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "esphome/components/event/event.h"
++#include "esphome/core/component.h"
++
++namespace esphome::quietcool {
++
++// The Home Assistant-visible signal for a permission-to-start refusal (see
++// QuietCoolComponent::set_start_refused_event()'s declaration for why an
++// `event` entity rather than a text sensor). No state of its own beyond what
++// event::Event already provides — trigger() is called directly by the
++// controller from request_state()'s gate, so this class exists only to give
++// that entity a Component identity (dump_config, registration) matching
++// every other QuietCool entity's shape.
++class QuietCoolStartRefusedEvent final : public Component, public event::Event {
++ public:
++  void dump_config() override;
++};
++
++}  // namespace esphome::quietcool
+diff -Nur diffbase/components/quietcool/event.py diffnew/components/quietcool/event.py
+--- diffbase/components/quietcool/event.py	1970-01-01 00:00:00.000000000 +0000
++++ diffnew/components/quietcool/event.py	2026-08-14 04:20:32.311039359 +0000
+@@ -0,0 +1,41 @@
++import esphome.codegen as cg
++from esphome.components import event
++import esphome.config_validation as cv
++
++from . import QuietCoolComponent, quietcool_ns
++
++
++CONF_CONTROLLER_ID = "controller_id"
++
++QuietCoolStartRefusedEvent = quietcool_ns.class_(
++    "QuietCoolStartRefusedEvent", cg.Component, event.Event
++)
++
++# One fixed event type today. Declared as a list because ESPHome's event
++# entity always carries a whole vocabulary via set_event_types() — a future
++# refusal reason (e.g. a degraded controller) could extend this list without
++# a schema change, so it is kept as a list rather than a single constant.
++EVENT_TYPE_NO_PERMISSION = "no_permission"
++
++CONFIG_SCHEMA = (
++    event.event_schema(QuietCoolStartRefusedEvent)
++    .extend(
++        {
++            cv.Required(CONF_CONTROLLER_ID): cv.use_id(QuietCoolComponent),
++        }
++    )
++    .extend(cv.COMPONENT_SCHEMA)
++)
++
++
++async def to_code(config):
++    # Subdirectory headers are not auto-included; declare the entity class.
++    cg.add_global(
++        cg.RawStatement(
++            '#include "quietcool/esphome/quietcool_permission_event.h"'
++        )
++    )
++    var = await event.new_event(config, event_types=[EVENT_TYPE_NO_PERMISSION])
++    await cg.register_component(var, config)
++    controller = await cg.get_variable(config[CONF_CONTROLLER_ID])
++    cg.add(controller.set_start_refused_event(var))
+diff -Nur diffbase/quietcool-cpp-example-sx126x.yaml diffnew/quietcool-cpp-example-sx126x.yaml
+--- diffbase/quietcool-cpp-example-sx126x.yaml	2026-08-14 04:20:32.268408811 +0000
++++ diffnew/quietcool-cpp-example-sx126x.yaml	2026-08-14 04:20:32.314744526 +0000
+@@ -102,6 +102,15 @@
+     controller_id: quietcool_controller
+     name: "Permission To Start"
+ 
++# HA-visible signal for a permission-to-start refusal — see
++# quietcool-cpp-lora32.yaml's matching block for why this is an `event`
++# entity rather than a text sensor.
++event:
++  - platform: quietcool
++    id: fan_start_refused
++    controller_id: quietcool_controller
++    name: "Fan Start Refused"
++
+ binary_sensor:
+   - platform: quietcool
+     controller_id: quietcool_controller
+diff -Nur diffbase/quietcool-cpp-example.yaml diffnew/quietcool-cpp-example.yaml
+--- diffbase/quietcool-cpp-example.yaml	2026-08-14 04:20:32.268438344 +0000
++++ diffnew/quietcool-cpp-example.yaml	2026-08-14 04:20:32.314774634 +0000
+@@ -111,6 +111,17 @@
+     controller_id: quietcool_controller
+     name: "Permission To Start"
+ 
++# HA-visible signal for a permission-to-start refusal (see
++# quietcool-cpp-lora32.yaml's matching block for why this is an `event`
++# entity, not a text sensor). Declared here for the same CI reason as switch
++# and select: this is one of the two examples CI actually compiles, so this
++# is what makes CI execute event.py's code generation at all.
++event:
++  - platform: quietcool
++    id: fan_start_refused
++    controller_id: quietcool_controller
++    name: "Fan Start Refused"
++
+ # Every option transmits and every option RUNS the fan: a duration started on
+ # a stopped fan starts it (at Low), and "None" means no timer — run until
+ # stopped — which restarts a fan whose timer already expired. This block also
+diff -Nur diffbase/quietcool-cpp-lora32.yaml diffnew/quietcool-cpp-lora32.yaml
+--- diffbase/quietcool-cpp-lora32.yaml	2026-08-14 04:20:32.268469415 +0000
++++ diffnew/quietcool-cpp-lora32.yaml	2026-08-14 04:20:32.314804822 +0000
+@@ -219,6 +219,18 @@
+     # the very first post-boot refresh finds the fan already running. See
+     # the "Safety" section of README.md.
+ 
++event:
++  - platform: quietcool
++    id: fan_start_refused
++    controller_id: quietcool_controller
++    name: "Fan Start Refused"
++    # Fires every time the Permission To Start failsafe above blocks a start
++    # command — including a repeat attempt while it is still off. Unlike a
++    # text sensor, an event entity always logs a fresh, timestamped entry in
++    # Home Assistant's Logbook regardless of repetition, so this is what to
++    # automate on (e.g. a notification) if someone tries to start the fan
++    # before permission has been granted.
++
+ binary_sensor:
+   - platform: quietcool
+     id: fan_state_known
+diff -Nur diffbase/tests/cpp/Makefile diffnew/tests/cpp/Makefile
+--- diffbase/tests/cpp/Makefile	2026-08-14 04:20:32.282662122 +0000
++++ diffnew/tests/cpp/Makefile	2026-08-14 04:20:32.314966904 +0000
+@@ -38,14 +38,15 @@
+ # minimal ESPHome stubs (tests/cpp/esphome_stubs) so the wiring that defers core
+ # re-entry — the adapter half of the loop-stack crash fix — is covered on the
+ # host instead of only by `esphome compile` and live uptime.
+-# quietcool_fan.cpp, quietcool_button.cpp, quietcool_timer_select.cpp and
+-# quietcool_permission_switch.cpp are excluded: they derive from
+-# esphome::fan::Fan, esphome::button::Button, esphome::select::Select and
+-# esphome::switch_::Switch respectively, whose surface (traits, FanCall,
+-# state restore, option lists, write_state/control/restore_mode) is large
+-# enough that stubbing it would be a reimplementation rather than a stub —
+-# and a stub big enough to be wrong is worse than no test. They stay covered
+-# by `esphome compile` in CI. The publication gate they rely on is separately
++# quietcool_fan.cpp, quietcool_button.cpp, quietcool_timer_select.cpp,
++# quietcool_permission_switch.cpp and quietcool_permission_event.cpp are
++# excluded: they derive from esphome::fan::Fan, esphome::button::Button,
++# esphome::select::Select, esphome::switch_::Switch and esphome::event::Event
++# respectively, whose surface (traits, FanCall, state restore, option lists,
++# write_state/control/restore_mode, event_types/trigger) is large enough that
++# stubbing it would be a reimplementation rather than a stub — and a stub big
++# enough to be wrong is worse than no test. They stay covered by
++# `esphome compile` in CI. The publication gate they rely on is separately
+ # unit-tested in ports/authority_publication_gate_test.cpp, and the
+ # permission-to-start gating/auto-grant logic they call into lives entirely
+ # in quietcool_component.cpp (which IS in this suite) and is unit-tested in
+@@ -55,7 +56,8 @@
+ # decision they make belongs in a linked file (fan_command.cpp,
+ # timer_command.cpp), or it is logic no test in this repo can reach — issue #15.
+ ADAPTER_SOURCES := $(filter-out %/quietcool_fan.cpp %/quietcool_button.cpp \
+-	%/quietcool_timer_select.cpp %/quietcool_permission_switch.cpp, \
++	%/quietcool_timer_select.cpp %/quietcool_permission_switch.cpp \
++	%/quietcool_permission_event.cpp, \
+ 	$(wildcard $(ROOT)/components/quietcool/esphome/*.cpp))
+ ADAPTER_TEST_SOURCES := $(shell find ./adapter -name '*_test.cpp' -print) \
+ 	esphome_stubs/esphome_stubs.cpp support/test_main.cpp
+diff -Nur diffbase/tests/cpp/adapter/permission_to_start_test.cpp diffnew/tests/cpp/adapter/permission_to_start_test.cpp
+--- diffbase/tests/cpp/adapter/permission_to_start_test.cpp	2026-08-14 04:20:32.282474595 +0000
++++ diffnew/tests/cpp/adapter/permission_to_start_test.cpp	2026-08-14 04:20:32.315587630 +0000
+@@ -13,6 +13,7 @@
+ 
+ #include "quietcool/esphome/quietcool_component.h"
+ 
++#include "esphome/components/event/event.h"
+ #include "esphome/components/switch/switch.h"
+ #include "esphome/components/text_sensor/text_sensor.h"
+ 
+@@ -270,5 +271,34 @@
+   QC_CHECK(!component.permission_to_start());
+ }
+ 
++QC_TEST("adapter",
++       "a refused start command fires the HA-visible event, even on "
++       "repeated denials") {
++  // The whole point of using event::Event rather than the existing text
++  // sensor: HA only republishes a text sensor on a VALUE CHANGE, so two
++  // denials in a row would look identical to HA after the first. trigger()
++  // must fire on every refusal, not just the first.
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  event::Event refused_event;
++  component.set_start_refused_event(&refused_event);
++
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  QC_CHECK_EQ(refused_event.triggered().size(), std::size_t(2));
++  QC_CHECK_EQ(refused_event.triggered()[0], std::string("no_permission"));
++  QC_CHECK_EQ(refused_event.triggered()[1], std::string("no_permission"));
++
++  // Off must never fire it: it is not a start command, and is never gated.
++  component.request_state(FanState::command(Speed::Low, Duration::Off));
++  QC_CHECK_EQ(refused_event.triggered().size(), std::size_t(2));
++
++  // Once granted, a start command must not fire it either.
++  component.set_permission_to_start(true);
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  QC_CHECK_EQ(refused_event.triggered().size(), std::size_t(2));
++}
++
+ }  // namespace
+ }  // namespace esphome::quietcool
+diff -Nur diffbase/tests/cpp/esphome_stubs/esphome/components/event/event.h diffnew/tests/cpp/esphome_stubs/esphome/components/event/event.h
+--- diffbase/tests/cpp/esphome_stubs/esphome/components/event/event.h	1970-01-01 00:00:00.000000000 +0000
++++ diffnew/tests/cpp/esphome_stubs/esphome/components/event/event.h	2026-08-14 04:20:32.317396784 +0000
+@@ -0,0 +1,31 @@
++#pragma once
++
++// Host stub. Records triggered event types so tests can assert what Home
++// Assistant would have been told. Covers only the surface
++// quietcool_component.{h,cpp} touches (a bare pointer and trigger()) — the
++// real event::Event base (event_types, last_event_type tracking) is
++// exercised only via `esphome compile` in CI, exactly like switch_::Switch
++// (see esphome_stubs/README.md and the ADAPTER_SOURCES exclusion in
++// tests/cpp/Makefile).
++
++#include <string>
++#include <vector>
++
++namespace esphome::event {
++
++class Event {
++ public:
++  virtual ~Event() = default;
++
++  virtual void trigger(const std::string& event_type) {
++    triggered_.push_back(event_type);
++  }
++
++  const std::vector<std::string>& triggered() const { return triggered_; }
++  void clear_triggered() { triggered_.clear(); }
++
++ private:
++  std::vector<std::string> triggered_;
++};
++
++}  // namespace esphome::event

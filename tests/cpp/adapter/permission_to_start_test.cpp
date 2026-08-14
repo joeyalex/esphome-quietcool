@@ -13,6 +13,7 @@
 
 #include "quietcool/esphome/quietcool_component.h"
 
+#include "esphome/components/event/event.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 
@@ -268,6 +269,35 @@ QC_TEST("adapter",
   component.publish_authority_for_test(manual_confirmed);
 
   QC_CHECK(!component.permission_to_start());
+}
+
+QC_TEST("adapter",
+       "a refused start command fires the HA-visible event, even on "
+       "repeated denials") {
+  // The whole point of using event::Event rather than the existing text
+  // sensor: HA only republishes a text sensor on a VALUE CHANGE, so two
+  // denials in a row would look identical to HA after the first. trigger()
+  // must fire on every refusal, not just the first.
+  ::quietcool::test::FakeRadio radio;
+  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
+                               kJitterSeed);
+  event::Event refused_event;
+  component.set_start_refused_event(&refused_event);
+
+  component.request_state(FanState::command(Speed::High, Duration::Hours1));
+  component.request_state(FanState::command(Speed::High, Duration::Hours1));
+  QC_CHECK_EQ(refused_event.triggered().size(), std::size_t(2));
+  QC_CHECK_EQ(refused_event.triggered()[0], std::string("no_permission"));
+  QC_CHECK_EQ(refused_event.triggered()[1], std::string("no_permission"));
+
+  // Off must never fire it: it is not a start command, and is never gated.
+  component.request_state(FanState::command(Speed::Low, Duration::Off));
+  QC_CHECK_EQ(refused_event.triggered().size(), std::size_t(2));
+
+  // Once granted, a start command must not fire it either.
+  component.set_permission_to_start(true);
+  component.request_state(FanState::command(Speed::High, Duration::Hours1));
+  QC_CHECK_EQ(refused_event.triggered().size(), std::size_t(2));
 }
 
 }  // namespace

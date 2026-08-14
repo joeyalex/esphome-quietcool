@@ -227,6 +227,13 @@ void QuietCoolComponent::request_state(::quietcool::FanState requested) {
              "Confirm enough windows are open for makeup air, then enable "
              "the Permission To Start switch (Refresh and Off remain "
              "available while it is off).");
+    // Home Assistant visibility for this specific refusal (see
+    // set_start_refused_event()'s declaration): the core is never told
+    // about a gate-level refusal, so nothing else publishes anything HA can
+    // see for it. trigger() fires every call, not just on change, so a
+    // second denial in a row still shows up in the Logbook.
+    if (start_refused_event_ != nullptr)
+      start_refused_event_->trigger("no_permission");
     return;
   }
   const auto now_ms = clock_.now_ms();
