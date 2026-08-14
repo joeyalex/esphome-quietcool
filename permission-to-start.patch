@@ -1,0 +1,888 @@
+diff --git a/components/quietcool/__init__.py b/components/quietcool/__init__.py
+index 572731a..637cfe2 100644
+--- a/components/quietcool/__init__.py
++++ b/components/quietcool/__init__.py
+@@ -13,7 +13,15 @@ from esphome.const import CONF_ID, CONF_TYPE
+ # its select/select.h include only resolves when the select component is
+ # loaded — without this, a config with no select: block (both CI example
+ # YAMLs) fails to compile (adversarial round 4, codex).
+-AUTO_LOAD = ["binary_sensor", "button", "fan", "select", "sensor", "text_sensor"]
++AUTO_LOAD = [
++    "binary_sensor",
++    "button",
++    "fan",
++    "select",
++    "sensor",
++    "switch",
++    "text_sensor",
++]
+ CODEOWNERS = []
+ 
+ CONF_ADAPTER_ID = "adapter_id"
+diff --git a/components/quietcool/esphome/quietcool_component.cpp b/components/quietcool/esphome/quietcool_component.cpp
+index d037a0b..82cf114 100644
+--- a/components/quietcool/esphome/quietcool_component.cpp
++++ b/components/quietcool/esphome/quietcool_component.cpp
+@@ -212,10 +212,65 @@ void QuietCoolComponent::flush_rx_counter_publications(
+ 
+ void QuietCoolComponent::request_state(::quietcool::FanState requested) {
+   if (degraded_) return;
++  // Permission-to-start failsafe (item 2 of the design): every start command
++  // is refused here, BEFORE the core ever sees it, until permission_to_start_
++  // is true. Off is never gated — is_on() is false for it — and Refresh does
++  // not route through this function at all, so both of the two commands the
++  // spec allows while ungranted (refresh state, turn off) are untouched. This
++  // sits ahead of the degraded_ check's sibling apply_effects() call rather
++  // than inside core: gating in the adapter keeps the platform-free core
++  // ignorant of an ESPHome-facing HA workflow, and refusing here means an
++  // ungranted start never reaches the radio at all, not even a query.
++  if (requested.is_on() && !permission_to_start_) {
++    ESP_LOGW(kTag,
++             "Fan start refused: permission to start has not been granted. "
++             "Confirm enough windows are open for makeup air, then enable "
++             "the Permission To Start switch (Refresh and Off remain "
++             "available while it is off).");
++    return;
++  }
+   const auto now_ms = clock_.now_ms();
+   apply_effects(core_.request_state(requested, now_ms), now_ms);
+ }
+ 
++void QuietCoolComponent::set_permission_to_start(bool granted) {
++  permission_to_start_ = granted;
++  ESP_LOGI(kTag, "Permission to start %s", granted ? "GRANTED" : "REVOKED");
++  if (permission_switch_ != nullptr)
++    permission_switch_->publish_state(permission_to_start_);
++}
++
++void QuietCoolComponent::maybe_auto_grant_permission_to_start(
++    const ::quietcool::AuthoritySnapshot& authority) {
++  if (permission_to_start_) return;
++  const auto* confirmed =
++      std::get_if<::quietcool::ConfirmedStateAuthority>(&authority.state);
++  if (confirmed == nullptr) return;
++  // BootQueryConsensus is set at exactly one site (confirmation_observation.cpp):
++  // a confirmed report received while the coordinator is in
++  // BootResponseListening, which is reachable only from the mandatory,
++  // non-energizing query on_radio_ready() fires once at boot/OTA (see
++  // confirmation_reducer.cpp). Every other confirmation source — a manual
++  // Refresh, a post-command consensus, a fallback or recovery query, an
++  // OEM-remote observation — deliberately does NOT auto-grant: item 3 of the
++  // design is specifically "an ON-BOOT refresh finding the fan already
++  // running", not "any evidence the fan is running right now". A fan that
++  // starts running normally after boot must still go through an explicit
++  // grant.
++  if (confirmed->source != ::quietcool::EvidenceSource::BootQueryConsensus)
++    return;
++  if (!confirmed->state.is_on()) return;
++  // The fan was already running when this controller first came up: it did
++  // not start it, so there is nothing this failsafe needs to protect against
++  // yet, and continuing to block Refresh-confirmed reality would only turn
++  // "restart after a controller reboot" into an unwanted forced Off.
++  permission_to_start_ = true;
++  ESP_LOGW(kTag,
++           "On-boot refresh found the fan already running; permission to "
++           "start auto-granted (assumed safe to continue running)");
++  if (permission_switch_ != nullptr) permission_switch_->publish_state(true);
++}
++
+ void QuietCoolComponent::request_manual_refresh() {
+   if (degraded_) return;
+   const auto now_ms = clock_.now_ms();
+@@ -477,6 +532,15 @@ void QuietCoolComponent::apply_burst_event(
+ void QuietCoolComponent::deliver_authority(
+     const ::quietcool::AuthoritySnapshot& authority,
+     ::quietcool::MonotonicMs now_ms) {
++  // Checked on every delivery — in-place AND post-drain, exactly like the two
++  // stages below — rather than only from setup(): PublishAuthorityEffect is
++  // the single channel every confirmed authority reaches this adapter
++  // through, in-place or post-drain, so this is the one place that can see a
++  // BootQueryConsensus confirmation regardless of which channel carried it.
++  // Ordered first, ahead of the publisher fan-out: a permission_to_start_
++  // change never itself needs a publisher to see the entity fan (it is not
++  // authority), so there is no ordering hazard in also being first.
++  maybe_auto_grant_permission_to_start(authority);
+   // One delivery, three stages, in failure-direction order (rounds 10-11):
+   //  1. PUBLISHERS (fan, select) — the entities whose displayed state other
+   //     automations read before acting; they must be current first.
+diff --git a/components/quietcool/esphome/quietcool_component.h b/components/quietcool/esphome/quietcool_component.h
+index b6a8731..389dbbf 100644
+--- a/components/quietcool/esphome/quietcool_component.h
++++ b/components/quietcool/esphome/quietcool_component.h
+@@ -9,6 +9,7 @@
+ 
+ #include "esphome/components/binary_sensor/binary_sensor.h"
+ #include "esphome/components/sensor/sensor.h"
++#include "esphome/components/switch/switch.h"
+ #include "esphome/components/text_sensor/text_sensor.h"
+ #include "esphome/core/component.h"
+ #include "esphome/core/log.h"
+@@ -136,6 +137,33 @@ class QuietCoolComponent final : public Component {
+   void set_rx_rejected_count_sensor(sensor::Sensor* sensor) {
+     rx_rejected_count_sensor_ = sensor;
+   }
++  // Permission-to-start failsafe. The flag itself always starts false
++  // (field initializer below) and this setter re-publishes whatever the
++  // current value is to a newly-registered switch — the same "replay on
++  // register" discipline the other setters use above, so a switch wired up
++  // after an auto-grant (or after some other entity's on_boot lambda queries
++  // it) still shows the true state instead of the switch's own compiled
++  // default. This is not a degraded_ replay (permission has nothing to do
++  // with terminal degradation); it exists so registration order can never
++  // strand the entity on a stale value.
++  void set_permission_switch(switch_::Switch* permission_switch) {
++    permission_switch_ = permission_switch;
++    if (permission_switch_ != nullptr)
++      permission_switch_->publish_state(permission_to_start_);
++  }
++  // True once it is safe to energize the fan: either Home Assistant has
++  // explicitly granted permission (the switch's write_state path), or the
++  // mandatory on-boot refresh found the fan already confirmed running (see
++  // the BootQueryConsensus branch in deliver_authority()). Read by
++  // request_state() to refuse every start command until one of those has
++  // happened; never read to gate Off or Refresh, which must always work.
++  bool permission_to_start() const { return permission_to_start_; }
++  // The switch entity's write_state() calls this directly for both
++  // directions: HA granting permission (windows are open) and HA revoking it
++  // (windows are closing) are both legitimate, deliberate operator actions.
++  // Revoking only blocks FUTURE start commands — it does not stop a fan that
++  // is already running, matching the plain reading of "permission to start".
++  void set_permission_to_start(bool granted);
+   void on_radio_packet(::quietcool::ByteView packet);
+   void request_state(::quietcool::FanState requested);
+   void request_manual_refresh();
+@@ -224,6 +252,16 @@ class QuietCoolComponent final : public Component {
+                          ::quietcool::MonotonicMs now_ms);
+   void degrade(const char* reason);
+   void note_budget_exhaustion();
++  // Auto-grants permission_to_start_ from a confirmed authority snapshot
++  // (item 3 of the permission-to-start design): fires only for the ONE
++  // specific evidence source that means "the mandatory on-boot refresh, not
++  // any later query, found the fan already running" — see the definition
++  // site in quietcool_component.cpp for why BootQueryConsensus is the exact
++  // and only trigger. A no-op once permission_to_start_ is already true, so
++  // it is safe to call on every authority delivery rather than threading a
++  // boot-only flag through deliver_authority's callers.
++  void maybe_auto_grant_permission_to_start(
++      const ::quietcool::AuthoritySnapshot& authority);
+   // Publishes Last Confirmed Fan State and Fan Speed Capability from the
+   // authority snapshot the PublishAuthorityEffect branch of apply_effect()
+   // already carries — the same site every other AuthorityPublisher is fanned
+@@ -318,6 +356,18 @@ class QuietCoolComponent final : public Component {
+   sensor::Sensor* tx_count_sensor_{nullptr};
+   sensor::Sensor* rx_valid_count_sensor_{nullptr};
+   sensor::Sensor* rx_rejected_count_sensor_{nullptr};
++  // Permission-to-start failsafe (see set_permission_to_start()'s
++  // declaration above). Deliberately NOT restored from flash and NOT part of
++  // RestorableState/preferences_: item 1 of the design requires false on
++  // EVERY boot, with no exception for a graceful reboot, so there must be no
++  // code path that could ever seed this true before either a fresh
++  // BootQueryConsensus confirmation or an explicit HA grant happens. The
++  // switch entity's own compiled restore_mode (ALWAYS_OFF, set in
++  // switch.py) enforces the same rule at the entity layer, so the internal
++  // flag and the HA-visible switch can never disagree about the boot
++  // default.
++  bool permission_to_start_{false};
++  switch_::Switch* permission_switch_{nullptr};
+ };
+ 
+ }  // namespace esphome::quietcool
+diff --git a/components/quietcool/esphome/quietcool_permission_switch.cpp b/components/quietcool/esphome/quietcool_permission_switch.cpp
+new file mode 100644
+index 0000000..a789a24
+--- /dev/null
++++ b/components/quietcool/esphome/quietcool_permission_switch.cpp
+@@ -0,0 +1,31 @@
++#include "quietcool_permission_switch.h"
++
++#include "esphome/core/log.h"
++
++namespace esphome::quietcool {
++namespace {
++
++constexpr char TAG[] = "quietcool.permission_switch";
++
++}  // namespace
++
++void QuietCoolPermissionSwitch::dump_config() {
++  LOG_SWITCH("", "QuietCool Permission To Start", this);
++}
++
++void QuietCoolPermissionSwitch::write_state(bool state) {
++  if (controller_ == nullptr) {
++    ESP_LOGE(TAG, "Switch write refused: controller is not configured");
++    return;
++  }
++  // The controller is the single source of truth for permission_to_start_
++  // (it may also flip this true on its own via the on-boot auto-grant path).
++  // set_permission_to_start() publishes this entity's state itself once the
++  // controller has recorded the change, rather than this method calling
++  // publish_state() directly — so an auto-grant racing a manual write can
++  // never leave the switch showing something the controller does not
++  // actually believe.
++  controller_->set_permission_to_start(state);
++}
++
++}  // namespace esphome::quietcool
+diff --git a/components/quietcool/esphome/quietcool_permission_switch.h b/components/quietcool/esphome/quietcool_permission_switch.h
+new file mode 100644
+index 0000000..70b488d
+--- /dev/null
++++ b/components/quietcool/esphome/quietcool_permission_switch.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include "quietcool_component.h"
++
++#include "esphome/components/switch/switch.h"
++#include "esphome/core/component.h"
++
++namespace esphome::quietcool {
++
++// The Home Assistant / ESP32-API face of the permission-to-start failsafe.
++// Deliberately a thin marshalling shell (issue #15's rule, same as
++// QuietCoolButton and QuietCoolFan): write_state() forwards the operator's
++// decision straight to the controller, and every actual gating decision
++// lives in QuietCoolComponent::request_state() and
++// maybe_auto_grant_permission_to_start(), which are host-tested. The one
++// piece of behavior that belongs here rather than in the controller is
++// restore_mode — set to ALWAYS_OFF in switch.py so this entity, like the
++// underlying flag, can never come back true on its own after a reboot.
++class QuietCoolPermissionSwitch final : public Component,
++                                        public switch_::Switch {
++ public:
++  void set_controller(QuietCoolComponent* controller) {
++    controller_ = controller;
++  }
++  void dump_config() override;
++
++ protected:
++  void write_state(bool state) override;
++
++ private:
++  QuietCoolComponent* controller_{nullptr};
++};
++
++}  // namespace esphome::quietcool
+diff --git a/components/quietcool/switch.py b/components/quietcool/switch.py
+new file mode 100644
+index 0000000..4f403be
+--- /dev/null
++++ b/components/quietcool/switch.py
+@@ -0,0 +1,50 @@
++import esphome.codegen as cg
++from esphome.components import switch
++import esphome.config_validation as cv
++
++from . import QuietCoolComponent, quietcool_ns
++
++
++CONF_CONTROLLER_ID = "controller_id"
++
++QuietCoolPermissionSwitch = quietcool_ns.class_(
++    "QuietCoolPermissionSwitch", cg.Component, switch.Switch
++)
++
++
++CONFIG_SCHEMA = (
++    switch.switch_schema(
++        QuietCoolPermissionSwitch,
++        # ALWAYS_OFF, not a persistent default: item 1 of the
++        # permission-to-start design requires the flag to start false on
++        # EVERY boot, including a graceful reboot where flash holds a
++        # previous "on". A restore mode that could ever load a persisted
++        # true would let a stale grant survive a reboot the operator meant
++        # to be a fresh safety check. The controller's own
++        # permission_to_start_ field mirrors this default independently
++        # (quietcool_component.h), so the internal flag and this entity can
++        # never disagree about what a boot means.
++        default_restore_mode="ALWAYS_OFF",
++        icon="mdi:fan-alert",
++    )
++    .extend(
++        {
++            cv.Required(CONF_CONTROLLER_ID): cv.use_id(QuietCoolComponent),
++        }
++    )
++    .extend(cv.COMPONENT_SCHEMA)
++)
++
++
++async def to_code(config):
++    # Subdirectory headers are not auto-included; declare the entity class.
++    cg.add_global(
++        cg.RawStatement(
++            '#include "quietcool/esphome/quietcool_permission_switch.h"'
++        )
++    )
++    var = await switch.new_switch(config)
++    await cg.register_component(var, config)
++    controller = await cg.get_variable(config[CONF_CONTROLLER_ID])
++    cg.add(var.set_controller(controller))
++    cg.add(controller.set_permission_switch(var))
+diff --git a/quietcool-cpp-example-sx126x.yaml b/quietcool-cpp-example-sx126x.yaml
+index 7d35194..eb469f4 100644
+--- a/quietcool-cpp-example-sx126x.yaml
++++ b/quietcool-cpp-example-sx126x.yaml
+@@ -91,6 +91,17 @@ fan:
+     controller_id: quietcool_controller
+     name: "Whole House Fan"
+ 
++# Permission-to-start failsafe (see README.md's Safety section and
++# quietcool-cpp-example.yaml's matching block): boots OFF every time and
++# gates the fan entity's start command until granted, either manually or
++# automatically when the first post-boot refresh finds the fan already
++# running.
++switch:
++  - platform: quietcool
++    id: permission_to_start
++    controller_id: quietcool_controller
++    name: "Permission To Start"
++
+ binary_sensor:
+   - platform: quietcool
+     controller_id: quietcool_controller
+diff --git a/quietcool-cpp-example.yaml b/quietcool-cpp-example.yaml
+index 4d1f567..a53bd45 100644
+--- a/quietcool-cpp-example.yaml
++++ b/quietcool-cpp-example.yaml
+@@ -98,6 +98,19 @@ fan:
+     controller_id: quietcool_controller
+     name: "Whole House Fan"
+ 
++# Permission-to-start failsafe (see README.md's Safety section): boots OFF
++# every time (restore_mode is forced ALWAYS_OFF in switch.py) and gates the
++# fan entity's start command until it is turned on, either by an operator in
++# Home Assistant or automatically when the very first post-boot refresh
++# finds the fan already running. Declared here for the same CI reason as the
++# select block below: this is one of the two examples CI actually compiles,
++# so this is what makes CI execute switch.py's code generation at all.
++switch:
++  - platform: quietcool
++    id: permission_to_start
++    controller_id: quietcool_controller
++    name: "Permission To Start"
++
+ # Every option transmits and every option RUNS the fan: a duration started on
+ # a stopped fan starts it (at Low), and "None" means no timer — run until
+ # stopped — which restarts a fan whose timer already expired. This block also
+diff --git a/quietcool-cpp-lora32.yaml b/quietcool-cpp-lora32.yaml
+index 7ed0e03..7582b57 100644
+--- a/quietcool-cpp-lora32.yaml
++++ b/quietcool-cpp-lora32.yaml
+@@ -205,6 +205,20 @@ fan:
+     controller_id: quietcool_controller
+     name: "QuietCool Fan"
+ 
++switch:
++  - platform: quietcool
++    id: permission_to_start
++    controller_id: quietcool_controller
++    name: "Permission To Start"
++    # SAFETY: this is the failsafe gate for the fan's start command. It
++    # always boots OFF (restore_mode is forced ALWAYS_OFF in switch.py,
++    # independent of this option) and, while off, the fan entity's Off and
++    # Refresh keep working but a start command is refused before it ever
++    # reaches the radio. Turn this on only after confirming enough windows
++    # are open for makeup air; the controller also turns it on by itself if
++    # the very first post-boot refresh finds the fan already running. See
++    # the "Safety" section of README.md.
++
+ binary_sensor:
+   - platform: quietcool
+     id: fan_state_known
+diff --git a/tests/cpp/Makefile b/tests/cpp/Makefile
+index ced6061..453ae7c 100644
+--- a/tests/cpp/Makefile
++++ b/tests/cpp/Makefile
+@@ -38,19 +38,24 @@ SANITIZE_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -g
+ # minimal ESPHome stubs (tests/cpp/esphome_stubs) so the wiring that defers core
+ # re-entry — the adapter half of the loop-stack crash fix — is covered on the
+ # host instead of only by `esphome compile` and live uptime.
+-# quietcool_fan.cpp, quietcool_button.cpp and quietcool_timer_select.cpp are
+-# excluded: they derive from esphome::fan::Fan, esphome::button::Button and
+-# esphome::select::Select, whose surface (traits, FanCall, state restore, option
+-# lists) is large enough that stubbing it would be a reimplementation rather
+-# than a stub — and a stub big enough to be wrong is worse than no test.
+-# They stay covered by `esphome compile` in CI. The publication gate they rely
+-# on is separately unit-tested in ports/authority_publication_gate_test.cpp.
++# quietcool_fan.cpp, quietcool_button.cpp, quietcool_timer_select.cpp and
++# quietcool_permission_switch.cpp are excluded: they derive from
++# esphome::fan::Fan, esphome::button::Button, esphome::select::Select and
++# esphome::switch_::Switch respectively, whose surface (traits, FanCall,
++# state restore, option lists, write_state/control/restore_mode) is large
++# enough that stubbing it would be a reimplementation rather than a stub —
++# and a stub big enough to be wrong is worse than no test. They stay covered
++# by `esphome compile` in CI. The publication gate they rely on is separately
++# unit-tested in ports/authority_publication_gate_test.cpp, and the
++# permission-to-start gating/auto-grant logic they call into lives entirely
++# in quietcool_component.cpp (which IS in this suite) and is unit-tested in
++# adapter/permission_to_start_test.cpp.
+ #
+ # The exclusion is why each of them must stay a thin marshalling shell: every
+ # decision they make belongs in a linked file (fan_command.cpp,
+ # timer_command.cpp), or it is logic no test in this repo can reach — issue #15.
+ ADAPTER_SOURCES := $(filter-out %/quietcool_fan.cpp %/quietcool_button.cpp \
+-	%/quietcool_timer_select.cpp, \
++	%/quietcool_timer_select.cpp %/quietcool_permission_switch.cpp, \
+ 	$(wildcard $(ROOT)/components/quietcool/esphome/*.cpp))
+ ADAPTER_TEST_SOURCES := $(shell find ./adapter -name '*_test.cpp' -print) \
+ 	esphome_stubs/esphome_stubs.cpp support/test_main.cpp
+diff --git a/tests/cpp/adapter/authority_fanout_test.cpp b/tests/cpp/adapter/authority_fanout_test.cpp
+index 3ccba44..d93421f 100644
+--- a/tests/cpp/adapter/authority_fanout_test.cpp
++++ b/tests/cpp/adapter/authority_fanout_test.cpp
+@@ -317,6 +317,14 @@ QC_TEST("adapter", "a snapshot made stale mid-delivery never reaches the sink")
+   commander.component = &component;
+   binary_sensor::BinarySensor state_known;
+   component.setup();
++  // The reentrant command below must actually reach the real core for this
++  // test's property to mean anything (it proves the core's OWN revision
++  // advances and invalidates the stale snapshot mid-delivery); the
++  // permission-to-start failsafe defaults to false and would otherwise
++  // refuse the Continuous-duration command at the adapter gate before core
++  // ever saw it, which is a different concern from the reentrancy this test
++  // exercises.
++  component.set_permission_to_start(true);
+   component.add_authority_publisher(&commander);
+   component.set_state_known_sensor(&state_known);
+ 
+@@ -371,6 +379,10 @@ QC_TEST("adapter", "a snapshot made stale mid-sink never reaches the diagnostics
+   state_known.component = &component;
+   text_sensor::TextSensor last_confirmed;
+   component.setup();
++  // Same reasoning as the mid-delivery test above: the reentrant command
++  // must reach the real core, not be refused by the permission-to-start
++  // gate, for the staleness re-check under test to fire.
++  component.set_permission_to_start(true);
+   component.set_state_known_sensor(&state_known);
+   component.set_last_confirmed_state_sensor(&last_confirmed);
+ 
+diff --git a/tests/cpp/adapter/component_deferral_test.cpp b/tests/cpp/adapter/component_deferral_test.cpp
+index 46885e9..9fe139b 100644
+--- a/tests/cpp/adapter/component_deferral_test.cpp
++++ b/tests/cpp/adapter/component_deferral_test.cpp
+@@ -430,7 +430,12 @@ QC_TEST("adapter", "setup after degrade does not re-enter the core") {
+ 
+   // Move the core to a distinctive state a fresh restore() would not
+   // reproduce. (request_learn no longer qualifies: the harness boots with a
+-  // compiled seed, so a Learn is refused since issue #16.)
++  // compiled seed, so a Learn is refused since issue #16.) The
++  // permission-to-start failsafe defaults to false and would otherwise
++  // refuse this Continuous-duration command at the adapter gate before it
++  // ever reached the core, which is a different concern from the
++  // degrade-then-setup reentrancy this test exercises.
++  harness.component().set_permission_to_start(true);
+   harness.component().request_state(
+       FanState::command(Speed::Low, Duration::Continuous));
+   QC_CHECK_EQ(harness.component().snapshot().state,
+diff --git a/tests/cpp/adapter/diagnostic_publication_test.cpp b/tests/cpp/adapter/diagnostic_publication_test.cpp
+index 95c09d5..259ad25 100644
+--- a/tests/cpp/adapter/diagnostic_publication_test.cpp
++++ b/tests/cpp/adapter/diagnostic_publication_test.cpp
+@@ -216,6 +216,10 @@ QC_TEST("adapter", "last tx command sensor publishes the outbound state byte as
+   component.set_last_tx_command_sensor(&sensor);
+   host_test::set_millis(0);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so this Hours-duration
++  // command reaches the core instead of being refused at the adapter gate
++  // (a separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+ 
+   // Overrides the pending boot query outright (matches
+   // component_deferral_test.cpp's "setup after degrade" pattern): HIGH + 1
+@@ -261,6 +265,10 @@ QC_TEST("adapter", "a fault after a transmitted frame still publishes last tx co
+   component.set_last_tx_command_sensor(&sensor);
+   host_test::set_millis(0);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so this Hours-duration
++  // command reaches the core instead of being refused at the adapter gate
++  // (a separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+ 
+   component.request_state(FanState::command(Speed::High, Duration::Hours1));
+ 
+@@ -309,6 +317,10 @@ QC_TEST("adapter", "a fault before any frame transmits publishes nothing") {
+   component.set_last_tx_command_sensor(&sensor);
+   host_test::set_millis(0);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so this Hours-duration
++  // command reaches the core instead of being refused at the adapter gate
++  // (a separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+ 
+   component.request_state(FanState::command(Speed::High, Duration::Hours1));
+ 
+diff --git a/tests/cpp/adapter/permission_to_start_test.cpp b/tests/cpp/adapter/permission_to_start_test.cpp
+new file mode 100644
+index 0000000..5e2de26
+--- /dev/null
++++ b/tests/cpp/adapter/permission_to_start_test.cpp
+@@ -0,0 +1,274 @@
++// Adapter-layer tests for the permission-to-start failsafe.
++//
++// The whole-house fan this firmware drives can damage itself or the house if
++// it starts with too few windows open for makeup air. permission_to_start_
++// exists so the controller refuses to originate a start command — at the
++// adapter layer, before the platform-free core ever sees the request — until
++// something has established it is safe: either Home Assistant has explicitly
++// granted permission (the switch entity's write_state path), or the
++// mandatory, non-energizing on-boot refresh found the fan already confirmed
++// running (so this controller did not start it, and there is nothing new to
++// protect against). Off and Refresh are never gated: a failsafe that could
++// itself block stopping the fan would be worse than none at all.
++
++#include "quietcool/esphome/quietcool_component.h"
++
++#include "esphome/components/switch/switch.h"
++#include "esphome/components/text_sensor/text_sensor.h"
++
++#include "esphome/core/hal.h"
++#include "esphome/core/preferences.h"
++
++#include "support/test.h"
++#include "support/test_doubles.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace esphome::quietcool {
++namespace {
++
++using ::quietcool::Duration;
++using ::quietcool::FanState;
++using ::quietcool::FrameBytes;
++using ::quietcool::Speed;
++
++constexpr std::uint32_t kSenderSeed = 0xCB004739U;
++constexpr std::uint32_t kPreferenceKey = 0x51434332U;
++constexpr std::uint32_t kJitterSeed = 0x51434332U;
++
++// Owns the stub NVS for one test and restores the global on the way out —
++// copied from radio_counters_test.cpp / component_deferral_test.cpp.
++class ScopedPreferences final {
++ public:
++  ScopedPreferences() {
++    previous_ = global_preferences;
++    global_preferences = &preferences_;
++  }
++  ~ScopedPreferences() { global_preferences = previous_; }
++
++ private:
++  ESPPreferences preferences_;
++  ESPPreferences* previous_{nullptr};
++};
++
++// The exact 6-byte OEM state report for kSenderSeed (0xCB004739) carrying
++// 0xDF: Speed::Low + Duration::Continuous per fan_state.cpp's bit layout
++// (raw & 0x0F == 0xF == Continuous; (raw >> 4) & 0x03 == 1 == Low) — an ON
++// state, matching the 0xDF convention core_timeline_test.cpp and others in
++// this suite already use for "the fan is running".
++FrameBytes on_report_frame() {
++  return {{0xCB, 0x00, 0x47, 0x39, 0xDF, 0xDF}};
++}
++
++QC_TEST("adapter",
++       "permission_to_start defaults false and refuses a start command "
++       "before it reaches the core") {
++  // Deliberately NOT provisioned (no setup()): if the gate under test did
++  // NOT intercept the request before core_.request_state(), the real core
++  // would refuse it anyway for being Unprovisioned — and that refusal
++  // publishes a CoreEvent (RequestRefused -> "refused" on the command status
++  // sensor, see esp_event_sink.cpp). Asserting the sensor stays untouched by
++  // the ON command is therefore the discriminating check: it proves the
++  // request never reached the core at all, not merely that the core also
++  // would have said no.
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  text_sensor::TextSensor command_status;
++  component.set_command_status_sensor(&command_status);
++
++  QC_CHECK(!component.permission_to_start());
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  QC_CHECK(command_status.published().empty());
++  QC_CHECK(radio.packets().empty());
++
++  // Off must still pass straight through to the core, ungated, even though
++  // the same unprovisioned core will itself refuse it — that refusal IS the
++  // "reached the core" signal this test needs.
++  component.request_state(FanState::command(Speed::Low, Duration::Off));
++  QC_CHECK(!command_status.published().empty());
++  QC_CHECK_EQ(command_status.published().back(), std::string("refused"));
++}
++
++QC_TEST("adapter",
++       "granting permission lets a start command reach the core and "
++       "transmit") {
++  ScopedPreferences preferences;
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  host_test::set_millis(0);
++  // Binds provisioned_sender_ via the compiled seed, matching
++  // radio_counters_test.cpp's "rx_valid_count_increments..." setup.
++  component.setup();
++
++  // Drain the boot query burst (3 physical frames) so the radio's packet
++  // count below counts only what THIS test's command transmits.
++  for (std::size_t pass = 0; pass < 30 && radio.packets().size() < 3;
++       ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++  QC_CHECK_EQ(radio.packets().size(), std::size_t(3));
++
++  QC_CHECK(!component.permission_to_start());
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  for (std::size_t pass = 0; pass < 30 && radio.packets().size() < 4;
++       ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++  // Still refused: permission was never granted, so no 4th frame goes out
++  // beyond the boot query's 3.
++  QC_CHECK_EQ(radio.packets().size(), std::size_t(3));
++
++  component.set_permission_to_start(true);
++  QC_CHECK(component.permission_to_start());
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  for (std::size_t pass = 0; pass < 30 && radio.packets().size() < 4;
++       ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++  // Now the command actually reaches the radio.
++  QC_CHECK(radio.packets().size() >= 4);
++}
++
++QC_TEST("adapter",
++       "revoking permission blocks a later start command again") {
++  ScopedPreferences preferences;
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  text_sensor::TextSensor command_status;
++  component.set_command_status_sensor(&command_status);
++  host_test::set_millis(0);
++  component.setup();
++  for (std::size_t pass = 0; pass < 30 && radio.packets().size() < 3;
++       ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++
++  component.set_permission_to_start(true);
++  component.set_permission_to_start(false);
++  QC_CHECK(!component.permission_to_start());
++
++  const auto before = command_status.published().size();
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  // The gate refused it silently again — no new command-status publication
++  // and no additional radio traffic.
++  QC_CHECK_EQ(command_status.published().size(), before);
++  QC_CHECK_EQ(radio.packets().size(), std::size_t(3));
++}
++
++QC_TEST("adapter",
++       "set_permission_switch replays the current value to a newly "
++       "registered switch") {
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  switch_::Switch late_switch;
++
++  // Registered before any grant: should reflect the false default.
++  component.set_permission_switch(&late_switch);
++  QC_CHECK(!late_switch.published().empty());
++  QC_CHECK(!late_switch.published().back());
++
++  component.set_permission_to_start(true);
++  QC_CHECK(!late_switch.published().empty());
++  QC_CHECK(late_switch.published().back());
++}
++
++QC_TEST("adapter",
++       "an on-boot refresh confirming the fan already running auto-grants "
++       "permission to start") {
++  ScopedPreferences preferences;
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  switch_::Switch permission_switch;
++  component.set_permission_switch(&permission_switch);
++  host_test::set_millis(0);
++  component.setup();
++
++  // Drive the boot query burst to completion (BootQueryTransmitting ->
++  // BootResponseListening happens on the burst's tx-complete callback, which
++  // apply_burst_event() delivers as soon as BurstComplete fires — see
++  // component_deferral_test.cpp's identical drive-to-3-frames pattern).
++  for (std::size_t pass = 0; pass < 30 && radio.packets().size() < 3;
++       ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++  QC_CHECK_EQ(radio.packets().size(), std::size_t(3));
++  QC_CHECK(!component.permission_to_start());
++
++  // Move well into the boot query's acceptance window
++  // (kDirectQueryAcceptStartMs=300 .. kDirectQueryAcceptEndMs=1100 after the
++  // burst's start) before the first response candidate, then send two
++  // independent, agreeing "fan is ON" reports kMinIndependentCandidateGapMs
++  // (60 ms) apart — the same two-frame consensus pattern
++  // core_timeline_test.cpp's consensus() helper uses.
++  host_test::advance_millis(500);
++  const auto report = on_report_frame();
++  component.on_radio_packet(::quietcool::ByteView(report.bytes));
++  host_test::advance_millis(65);
++  component.on_radio_packet(::quietcool::ByteView(report.bytes));
++
++  QC_CHECK(component.permission_to_start());
++  QC_CHECK(!permission_switch.published().empty());
++  QC_CHECK(permission_switch.published().back());
++
++  // Confirmation quarantines the coordinator (ResponseTailQuarantine) for
++  // the remainder of the response-tail window before it will accept a new
++  // request — the same kResponseTailEndMs (2500 ms from the query's anchor)
++  // core_timeline_test.cpp's REG-D case runs out. Clear it the same way:
++  // advance well past the tail before issuing the start command, so this
++  // test is asserting the permission gate specifically, not racing the
++  // quarantine window.
++  for (std::size_t pass = 0; pass < 80; ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++
++  // And the auto-grant actually unblocks a start command, with no manual
++  // grant needed.
++  const auto before = radio.packets().size();
++  component.request_state(FanState::command(Speed::High, Duration::Hours1));
++  for (std::size_t pass = 0; pass < 30 && radio.packets().size() <= before;
++       ++pass) {
++    host_test::advance_millis(50);
++    component.call_loop();
++  }
++  QC_CHECK(radio.packets().size() > before);
++}
++
++QC_TEST("adapter",
++       "a later confirmation that the fan is running does NOT retroactively "
++       "grant permission") {
++  // Only the on-boot refresh's own BootQueryConsensus may auto-grant (item 3
++  // of the design is specifically about what the FIRST refresh after boot
++  // finds, not "the fan is confirmed on at some point"). A manual Refresh
++  // later confirming the fan is running must not silently open the failsafe
++  // — Home Assistant must still grant it explicitly in that case.
++  ::quietcool::AuthoritySnapshot manual_confirmed{};
++  manual_confirmed.state = ::quietcool::ConfirmedStateAuthority{
++      FanState::command(Speed::Low, Duration::Continuous),
++      ::quietcool::EvidenceSource::ManualQueryConsensus,
++      ::quietcool::EvidenceConfidence::ExactBackedConsensus,
++      0, 2, std::nullopt, std::nullopt, 0};
++  manual_confirmed.revision = 0;
++
++  ::quietcool::test::FakeRadio radio;
++  QuietCoolComponent component(&radio, kSenderSeed, kPreferenceKey,
++                               kJitterSeed);
++  component.publish_authority_for_test(manual_confirmed);
++
++  QC_CHECK(!component.permission_to_start());
++}
++
++}  // namespace
++}  // namespace esphome::quietcool
+diff --git a/tests/cpp/adapter/preferences_adapter_test.cpp b/tests/cpp/adapter/preferences_adapter_test.cpp
+index 035dd8b..a512ce7 100644
+--- a/tests/cpp/adapter/preferences_adapter_test.cpp
++++ b/tests/cpp/adapter/preferences_adapter_test.cpp
+@@ -432,6 +432,10 @@ QC_TEST("preferences", "a two-speed confirmation narrows the entity and reaches
+   CapturingPublisher publisher;
+   component.add_authority_publisher(&publisher);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so the Continuous/HIGH
++  // commands below reach the core instead of being refused at the adapter
++  // gate (a separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+   // The entity is listed at the WIDEST band while nothing is known, so learning
+   // can only narrow it; the command band is the MED-free one.
+   FanSpeedBands bands;
+@@ -501,6 +505,10 @@ QC_TEST("preferences", "repeated confirmations of a known capability cost no fla
+   CapturingPublisher publisher;
+   component.add_authority_publisher(&publisher);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so the Continuous/HIGH
++  // commands below reach the core instead of being refused at the adapter
++  // gate (a separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+   QC_CHECK(loop_to(component, ::quietcool::CoordinatorState::Idle, 2000));
+ 
+   // One LOW command, confirmed by a 2-speed report (0x9F both halves).
+@@ -561,6 +569,10 @@ QC_TEST("preferences", "an echo-confirmed HIGH publishes the top level, not MED"
+   CapturingPublisher publisher;
+   component.add_authority_publisher(&publisher);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so the Continuous/HIGH
++  // commands below reach the core instead of being refused at the adapter
++  // gate (a separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+   FanSpeedBands bands;
+   bands.observe(publisher.last->speed_capability);
+   QC_CHECK_EQ(bands.entity(), 3);
+@@ -627,6 +639,10 @@ QC_TEST("preferences", "learning three speeds cannot widen the band under Home A
+   CapturingPublisher publisher;
+   component.add_authority_publisher(&publisher);
+   component.setup();
++  // Permission-to-start defaults to false; grant it so the press below
++  // reaches the core instead of being refused at the adapter gate (a
++  // separate concern from what this test exercises).
++  component.set_permission_to_start(true);
+ 
+   // What Home Assistant caches at ListEntities, before any RF evidence exists.
+   FanSpeedBands bands;
+diff --git a/tests/cpp/esphome_stubs/esphome/components/switch/switch.h b/tests/cpp/esphome_stubs/esphome/components/switch/switch.h
+new file mode 100644
+index 0000000..753ad61
+--- /dev/null
++++ b/tests/cpp/esphome_stubs/esphome/components/switch/switch.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++// Host stub. Records published values so tests can assert what Home
++// Assistant would have been told. This stub covers only the surface
++// quietcool_component.{h,cpp} touches (a bare pointer and publish_state()) —
++// the real switch_::Switch base (write_state, control/turn_on/turn_off,
++// restore_mode, inversion) is exercised only via `esphome compile` in CI,
++// exactly like button_::Button and fan::Fan (see esphome_stubs/README.md and
++// the ADAPTER_SOURCES exclusion in tests/cpp/Makefile). Do not grow this
++// stub to also model write_state()/control(): the moment it needs to, that
++// is the same signal the README calls out — the real class belongs on the
++// exclusion list instead of behind a stub good enough to be wrong.
++
++#include <vector>
++
++namespace esphome::switch_ {
++
++class Switch {
++ public:
++  virtual ~Switch() = default;
++
++  virtual void publish_state(bool state) {
++    state_ = state;
++    has_state_ = true;
++    published_.push_back(state);
++  }
++
++  bool state() const { return state_; }
++  bool has_state() const { return has_state_; }
++  const std::vector<bool>& published() const { return published_; }
++  void clear_published() { published_.clear(); }
++
++ private:
++  bool state_{false};
++  bool has_state_{false};
++  std::vector<bool> published_;
++};
++
++}  // namespace esphome::switch_
