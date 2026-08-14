@@ -216,6 +216,10 @@ QC_TEST("adapter", "last tx command sensor publishes the outbound state byte as 
   component.set_last_tx_command_sensor(&sensor);
   host_test::set_millis(0);
   component.setup();
+  // Permission-to-start defaults to false; grant it so this Hours-duration
+  // command reaches the core instead of being refused at the adapter gate
+  // (a separate concern from what this test exercises).
+  component.set_permission_to_start(true);
 
   // Overrides the pending boot query outright (matches
   // component_deferral_test.cpp's "setup after degrade" pattern): HIGH + 1
@@ -261,6 +265,10 @@ QC_TEST("adapter", "a fault after a transmitted frame still publishes last tx co
   component.set_last_tx_command_sensor(&sensor);
   host_test::set_millis(0);
   component.setup();
+  // Permission-to-start defaults to false; grant it so this Hours-duration
+  // command reaches the core instead of being refused at the adapter gate
+  // (a separate concern from what this test exercises).
+  component.set_permission_to_start(true);
 
   component.request_state(FanState::command(Speed::High, Duration::Hours1));
 
@@ -309,6 +317,10 @@ QC_TEST("adapter", "a fault before any frame transmits publishes nothing") {
   component.set_last_tx_command_sensor(&sensor);
   host_test::set_millis(0);
   component.setup();
+  // Permission-to-start defaults to false; grant it so this Hours-duration
+  // command reaches the core instead of being refused at the adapter gate
+  // (a separate concern from what this test exercises).
+  component.set_permission_to_start(true);
 
   component.request_state(FanState::command(Speed::High, Duration::Hours1));
 

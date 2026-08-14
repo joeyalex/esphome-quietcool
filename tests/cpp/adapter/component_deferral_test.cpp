@@ -430,7 +430,12 @@ QC_TEST("adapter", "setup after degrade does not re-enter the core") {
 
   // Move the core to a distinctive state a fresh restore() would not
   // reproduce. (request_learn no longer qualifies: the harness boots with a
-  // compiled seed, so a Learn is refused since issue #16.)
+  // compiled seed, so a Learn is refused since issue #16.) The
+  // permission-to-start failsafe defaults to false and would otherwise
+  // refuse this Continuous-duration command at the adapter gate before it
+  // ever reached the core, which is a different concern from the
+  // degrade-then-setup reentrancy this test exercises.
+  harness.component().set_permission_to_start(true);
   harness.component().request_state(
       FanState::command(Speed::Low, Duration::Continuous));
   QC_CHECK_EQ(harness.component().snapshot().state,

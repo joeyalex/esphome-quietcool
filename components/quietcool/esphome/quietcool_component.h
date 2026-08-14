@@ -9,6 +9,7 @@
 
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/switch/switch.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
@@ -136,6 +137,33 @@ class QuietCoolComponent final : public Component {
   void set_rx_rejected_count_sensor(sensor::Sensor* sensor) {
     rx_rejected_count_sensor_ = sensor;
   }
+  // Permission-to-start failsafe. The flag itself always starts false
+  // (field initializer below) and this setter re-publishes whatever the
+  // current value is to a newly-registered switch — the same "replay on
+  // register" discipline the other setters use above, so a switch wired up
+  // after an auto-grant (or after some other entity's on_boot lambda queries
+  // it) still shows the true state instead of the switch's own compiled
+  // default. This is not a degraded_ replay (permission has nothing to do
+  // with terminal degradation); it exists so registration order can never
+  // strand the entity on a stale value.
+  void set_permission_switch(switch_::Switch* permission_switch) {
+    permission_switch_ = permission_switch;
+    if (permission_switch_ != nullptr)
+      permission_switch_->publish_state(permission_to_start_);
+  }
+  // True once it is safe to energize the fan: either Home Assistant has
+  // explicitly granted permission (the switch's write_state path), or the
+  // mandatory on-boot refresh found the fan already confirmed running (see
+  // the BootQueryConsensus branch in deliver_authority()). Read by
+  // request_state() to refuse every start command until one of those has
+  // happened; never read to gate Off or Refresh, which must always work.
+  bool permission_to_start() const { return permission_to_start_; }
+  // The switch entity's write_state() calls this directly for both
+  // directions: HA granting permission (windows are open) and HA revoking it
+  // (windows are closing) are both legitimate, deliberate operator actions.
+  // Revoking only blocks FUTURE start commands — it does not stop a fan that
+  // is already running, matching the plain reading of "permission to start".
+  void set_permission_to_start(bool granted);
   void on_radio_packet(::quietcool::ByteView packet);
   void request_state(::quietcool::FanState requested);
   void request_manual_refresh();
@@ -224,6 +252,16 @@ class QuietCoolComponent final : public Component {
                          ::quietcool::MonotonicMs now_ms);
   void degrade(const char* reason);
   void note_budget_exhaustion();
+  // Auto-grants permission_to_start_ from a confirmed authority snapshot
+  // (item 3 of the permission-to-start design): fires only for the ONE
+  // specific evidence source that means "the mandatory on-boot refresh, not
+  // any later query, found the fan already running" — see the definition
+  // site in quietcool_component.cpp for why BootQueryConsensus is the exact
+  // and only trigger. A no-op once permission_to_start_ is already true, so
+  // it is safe to call on every authority delivery rather than threading a
+  // boot-only flag through deliver_authority's callers.
+  void maybe_auto_grant_permission_to_start(
+      const ::quietcool::AuthoritySnapshot& authority);
   // Publishes Last Confirmed Fan State and Fan Speed Capability from the
   // authority snapshot the PublishAuthorityEffect branch of apply_effect()
   // already carries — the same site every other AuthorityPublisher is fanned
@@ -318,6 +356,18 @@ class QuietCoolComponent final : public Component {
   sensor::Sensor* tx_count_sensor_{nullptr};
   sensor::Sensor* rx_valid_count_sensor_{nullptr};
   sensor::Sensor* rx_rejected_count_sensor_{nullptr};
+  // Permission-to-start failsafe (see set_permission_to_start()'s
+  // declaration above). Deliberately NOT restored from flash and NOT part of
+  // RestorableState/preferences_: item 1 of the design requires false on
+  // EVERY boot, with no exception for a graceful reboot, so there must be no
+  // code path that could ever seed this true before either a fresh
+  // BootQueryConsensus confirmation or an explicit HA grant happens. The
+  // switch entity's own compiled restore_mode (ALWAYS_OFF, set in
+  // switch.py) enforces the same rule at the entity layer, so the internal
+  // flag and the HA-visible switch can never disagree about the boot
+  // default.
+  bool permission_to_start_{false};
+  switch_::Switch* permission_switch_{nullptr};
 };
 
 }  // namespace esphome::quietcool

@@ -98,6 +98,19 @@ fan:
     controller_id: quietcool_controller
     name: "Whole House Fan"
 
+# Permission-to-start failsafe (see README.md's Safety section): boots OFF
+# every time (restore_mode is forced ALWAYS_OFF in switch.py) and gates the
+# fan entity's start command until it is turned on, either by an operator in
+# Home Assistant or automatically when the very first post-boot refresh
+# finds the fan already running. Declared here for the same CI reason as the
+# select block below: this is one of the two examples CI actually compiles,
+# so this is what makes CI execute switch.py's code generation at all.
+switch:
+  - platform: quietcool
+    id: permission_to_start
+    controller_id: quietcool_controller
+    name: "Permission To Start"
+
 # Every option transmits and every option RUNS the fan: a duration started on
 # a stopped fan starts it (at Low), and "None" means no timer — run until
 # stopped — which restarts a fan whose timer already expired. This block also

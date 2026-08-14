@@ -13,7 +13,15 @@ from esphome.const import CONF_ID, CONF_TYPE
 # its select/select.h include only resolves when the select component is
 # loaded — without this, a config with no select: block (both CI example
 # YAMLs) fails to compile (adversarial round 4, codex).
-AUTO_LOAD = ["binary_sensor", "button", "fan", "select", "sensor", "text_sensor"]
+AUTO_LOAD = [
+    "binary_sensor",
+    "button",
+    "fan",
+    "select",
+    "sensor",
+    "switch",
+    "text_sensor",
+]
 CODEOWNERS = []
 
 CONF_ADAPTER_ID = "adapter_id"

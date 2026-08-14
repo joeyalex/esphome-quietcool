@@ -38,19 +38,24 @@ SANITIZE_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -g
 # minimal ESPHome stubs (tests/cpp/esphome_stubs) so the wiring that defers core
 # re-entry — the adapter half of the loop-stack crash fix — is covered on the
 # host instead of only by `esphome compile` and live uptime.
-# quietcool_fan.cpp, quietcool_button.cpp and quietcool_timer_select.cpp are
-# excluded: they derive from esphome::fan::Fan, esphome::button::Button and
-# esphome::select::Select, whose surface (traits, FanCall, state restore, option
-# lists) is large enough that stubbing it would be a reimplementation rather
-# than a stub — and a stub big enough to be wrong is worse than no test.
-# They stay covered by `esphome compile` in CI. The publication gate they rely
-# on is separately unit-tested in ports/authority_publication_gate_test.cpp.
+# quietcool_fan.cpp, quietcool_button.cpp, quietcool_timer_select.cpp and
+# quietcool_permission_switch.cpp are excluded: they derive from
+# esphome::fan::Fan, esphome::button::Button, esphome::select::Select and
+# esphome::switch_::Switch respectively, whose surface (traits, FanCall,
+# state restore, option lists, write_state/control/restore_mode) is large
+# enough that stubbing it would be a reimplementation rather than a stub —
+# and a stub big enough to be wrong is worse than no test. They stay covered
+# by `esphome compile` in CI. The publication gate they rely on is separately
+# unit-tested in ports/authority_publication_gate_test.cpp, and the
+# permission-to-start gating/auto-grant logic they call into lives entirely
+# in quietcool_component.cpp (which IS in this suite) and is unit-tested in
+# adapter/permission_to_start_test.cpp.
 #
 # The exclusion is why each of them must stay a thin marshalling shell: every
 # decision they make belongs in a linked file (fan_command.cpp,
 # timer_command.cpp), or it is logic no test in this repo can reach — issue #15.
 ADAPTER_SOURCES := $(filter-out %/quietcool_fan.cpp %/quietcool_button.cpp \
-	%/quietcool_timer_select.cpp, \
+	%/quietcool_timer_select.cpp %/quietcool_permission_switch.cpp, \
 	$(wildcard $(ROOT)/components/quietcool/esphome/*.cpp))
 ADAPTER_TEST_SOURCES := $(shell find ./adapter -name '*_test.cpp' -print) \
 	esphome_stubs/esphome_stubs.cpp support/test_main.cpp

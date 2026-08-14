@@ -432,6 +432,10 @@ QC_TEST("preferences", "a two-speed confirmation narrows the entity and reaches 
   CapturingPublisher publisher;
   component.add_authority_publisher(&publisher);
   component.setup();
+  // Permission-to-start defaults to false; grant it so the Continuous/HIGH
+  // commands below reach the core instead of being refused at the adapter
+  // gate (a separate concern from what this test exercises).
+  component.set_permission_to_start(true);
   // The entity is listed at the WIDEST band while nothing is known, so learning
   // can only narrow it; the command band is the MED-free one.
   FanSpeedBands bands;
@@ -501,6 +505,10 @@ QC_TEST("preferences", "repeated confirmations of a known capability cost no fla
   CapturingPublisher publisher;
   component.add_authority_publisher(&publisher);
   component.setup();
+  // Permission-to-start defaults to false; grant it so the Continuous/HIGH
+  // commands below reach the core instead of being refused at the adapter
+  // gate (a separate concern from what this test exercises).
+  component.set_permission_to_start(true);
   QC_CHECK(loop_to(component, ::quietcool::CoordinatorState::Idle, 2000));
 
   // One LOW command, confirmed by a 2-speed report (0x9F both halves).
@@ -561,6 +569,10 @@ QC_TEST("preferences", "an echo-confirmed HIGH publishes the top level, not MED"
   CapturingPublisher publisher;
   component.add_authority_publisher(&publisher);
   component.setup();
+  // Permission-to-start defaults to false; grant it so the Continuous/HIGH
+  // commands below reach the core instead of being refused at the adapter
+  // gate (a separate concern from what this test exercises).
+  component.set_permission_to_start(true);
   FanSpeedBands bands;
   bands.observe(publisher.last->speed_capability);
   QC_CHECK_EQ(bands.entity(), 3);
@@ -627,6 +639,10 @@ QC_TEST("preferences", "learning three speeds cannot widen the band under Home A
   CapturingPublisher publisher;
   component.add_authority_publisher(&publisher);
   component.setup();
+  // Permission-to-start defaults to false; grant it so the press below
+  // reaches the core instead of being refused at the adapter gate (a
+  // separate concern from what this test exercises).
+  component.set_permission_to_start(true);
 
   // What Home Assistant caches at ListEntities, before any RF evidence exists.
   FanSpeedBands bands;

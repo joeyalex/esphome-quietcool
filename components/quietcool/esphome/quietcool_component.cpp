@@ -212,8 +212,63 @@ void QuietCoolComponent::flush_rx_counter_publications(
 
 void QuietCoolComponent::request_state(::quietcool::FanState requested) {
   if (degraded_) return;
+  // Permission-to-start failsafe (item 2 of the design): every start command
+  // is refused here, BEFORE the core ever sees it, until permission_to_start_
+  // is true. Off is never gated — is_on() is false for it — and Refresh does
+  // not route through this function at all, so both of the two commands the
+  // spec allows while ungranted (refresh state, turn off) are untouched. This
+  // sits ahead of the degraded_ check's sibling apply_effects() call rather
+  // than inside core: gating in the adapter keeps the platform-free core
+  // ignorant of an ESPHome-facing HA workflow, and refusing here means an
+  // ungranted start never reaches the radio at all, not even a query.
+  if (requested.is_on() && !permission_to_start_) {
+    ESP_LOGW(kTag,
+             "Fan start refused: permission to start has not been granted. "
+             "Confirm enough windows are open for makeup air, then enable "
+             "the Permission To Start switch (Refresh and Off remain "
+             "available while it is off).");
+    return;
+  }
   const auto now_ms = clock_.now_ms();
   apply_effects(core_.request_state(requested, now_ms), now_ms);
+}
+
+void QuietCoolComponent::set_permission_to_start(bool granted) {
+  permission_to_start_ = granted;
+  ESP_LOGI(kTag, "Permission to start %s", granted ? "GRANTED" : "REVOKED");
+  if (permission_switch_ != nullptr)
+    permission_switch_->publish_state(permission_to_start_);
+}
+
+void QuietCoolComponent::maybe_auto_grant_permission_to_start(
+    const ::quietcool::AuthoritySnapshot& authority) {
+  if (permission_to_start_) return;
+  const auto* confirmed =
+      std::get_if<::quietcool::ConfirmedStateAuthority>(&authority.state);
+  if (confirmed == nullptr) return;
+  // BootQueryConsensus is set at exactly one site (confirmation_observation.cpp):
+  // a confirmed report received while the coordinator is in
+  // BootResponseListening, which is reachable only from the mandatory,
+  // non-energizing query on_radio_ready() fires once at boot/OTA (see
+  // confirmation_reducer.cpp). Every other confirmation source — a manual
+  // Refresh, a post-command consensus, a fallback or recovery query, an
+  // OEM-remote observation — deliberately does NOT auto-grant: item 3 of the
+  // design is specifically "an ON-BOOT refresh finding the fan already
+  // running", not "any evidence the fan is running right now". A fan that
+  // starts running normally after boot must still go through an explicit
+  // grant.
+  if (confirmed->source != ::quietcool::EvidenceSource::BootQueryConsensus)
+    return;
+  if (!confirmed->state.is_on()) return;
+  // The fan was already running when this controller first came up: it did
+  // not start it, so there is nothing this failsafe needs to protect against
+  // yet, and continuing to block Refresh-confirmed reality would only turn
+  // "restart after a controller reboot" into an unwanted forced Off.
+  permission_to_start_ = true;
+  ESP_LOGW(kTag,
+           "On-boot refresh found the fan already running; permission to "
+           "start auto-granted (assumed safe to continue running)");
+  if (permission_switch_ != nullptr) permission_switch_->publish_state(true);
 }
 
 void QuietCoolComponent::request_manual_refresh() {
@@ -477,6 +532,15 @@ void QuietCoolComponent::apply_burst_event(
 void QuietCoolComponent::deliver_authority(
     const ::quietcool::AuthoritySnapshot& authority,
     ::quietcool::MonotonicMs now_ms) {
+  // Checked on every delivery — in-place AND post-drain, exactly like the two
+  // stages below — rather than only from setup(): PublishAuthorityEffect is
+  // the single channel every confirmed authority reaches this adapter
+  // through, in-place or post-drain, so this is the one place that can see a
+  // BootQueryConsensus confirmation regardless of which channel carried it.
+  // Ordered first, ahead of the publisher fan-out: a permission_to_start_
+  // change never itself needs a publisher to see the entity fan (it is not
+  // authority), so there is no ordering hazard in also being first.
+  maybe_auto_grant_permission_to_start(authority);
   // One delivery, three stages, in failure-direction order (rounds 10-11):
   //  1. PUBLISHERS (fan, select) — the entities whose displayed state other
   //     automations read before acting; they must be current first.

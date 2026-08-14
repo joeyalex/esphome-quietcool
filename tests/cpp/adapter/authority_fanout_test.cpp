@@ -317,6 +317,14 @@ QC_TEST("adapter", "a snapshot made stale mid-delivery never reaches the sink") 
   commander.component = &component;
   binary_sensor::BinarySensor state_known;
   component.setup();
+  // The reentrant command below must actually reach the real core for this
+  // test's property to mean anything (it proves the core's OWN revision
+  // advances and invalidates the stale snapshot mid-delivery); the
+  // permission-to-start failsafe defaults to false and would otherwise
+  // refuse the Continuous-duration command at the adapter gate before core
+  // ever saw it, which is a different concern from the reentrancy this test
+  // exercises.
+  component.set_permission_to_start(true);
   component.add_authority_publisher(&commander);
   component.set_state_known_sensor(&state_known);
 
@@ -371,6 +379,10 @@ QC_TEST("adapter", "a snapshot made stale mid-sink never reaches the diagnostics
   state_known.component = &component;
   text_sensor::TextSensor last_confirmed;
   component.setup();
+  // Same reasoning as the mid-delivery test above: the reentrant command
+  // must reach the real core, not be refused by the permission-to-start
+  // gate, for the staleness re-check under test to fire.
+  component.set_permission_to_start(true);
   component.set_state_known_sensor(&state_known);
   component.set_last_confirmed_state_sensor(&last_confirmed);
 

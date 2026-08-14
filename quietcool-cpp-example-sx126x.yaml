@@ -91,6 +91,17 @@ fan:
     controller_id: quietcool_controller
     name: "Whole House Fan"
 
+# Permission-to-start failsafe (see README.md's Safety section and
+# quietcool-cpp-example.yaml's matching block): boots OFF every time and
+# gates the fan entity's start command until granted, either manually or
+# automatically when the first post-boot refresh finds the fan already
+# running.
+switch:
+  - platform: quietcool
+    id: permission_to_start
+    controller_id: quietcool_controller
+    name: "Permission To Start"
+
 binary_sensor:
   - platform: quietcool
     controller_id: quietcool_controller

@@ -205,6 +205,20 @@ fan:
     controller_id: quietcool_controller
     name: "QuietCool Fan"
 
+switch:
+  - platform: quietcool
+    id: permission_to_start
+    controller_id: quietcool_controller
+    name: "Permission To Start"
+    # SAFETY: this is the failsafe gate for the fan's start command. It
+    # always boots OFF (restore_mode is forced ALWAYS_OFF in switch.py,
+    # independent of this option) and, while off, the fan entity's Off and
+    # Refresh keep working but a start command is refused before it ever
+    # reaches the radio. Turn this on only after confirming enough windows
+    # are open for makeup air; the controller also turns it on by itself if
+    # the very first post-boot refresh finds the fan already running. See
+    # the "Safety" section of README.md.
+
 binary_sensor:
   - platform: quietcool
     id: fan_state_known
